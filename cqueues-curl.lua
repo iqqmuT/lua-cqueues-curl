@@ -29,15 +29,16 @@ local function curl_timerfunction(ms)
 	timeout = ms >= 0 and ms / 1000 or nil
 	if not timercond then
 		-- Start timer if not yet running
-		timeout = nil
 		timercond = condition.new()
 		cqueues.running():wrap(function()
-			local reason = cqueues.poll(timercond, timeout)
-			if reason ~= timercond or timeout == 0 then
-				trace("TIMEOUT")
-				timeout = nil
-				cqcurl.multi:socket_action()
-				curl_check_multi_info()
+			while timeout ~= nil do
+				local reason = cqueues.poll(timercond, timeout)
+				if reason ~= timercond or timeout == 0 then
+					trace("TIMEOUT")
+					timeout = nil
+					cqcurl.multi:socket_action()
+					curl_check_multi_info()
+				end
 			end
 		end)
 	else
