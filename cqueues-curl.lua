@@ -2,153 +2,123 @@ local cqueues = require 'cqueues'
 local condition = require 'cqueues.condition'
 local curl = require 'cURL'
 
-local trace = true do
+local cqcurl = {}
 
-trace = trace and print or function() end
+local trace = false and print or function() end
+local fdobjs = {}
 
-end
-
-local ACTION_NAMES = {
-  [curl.POLL_IN     ] = "POLL_IN";
-  [curl.POLL_INOUT  ] = "POLL_INOUT";
-  [curl.POLL_OUT    ] = "POLL_OUT";
-  [curl.POLL_NONE   ] = "POLL_NONE";
-  [curl.POLL_REMOVE ] = "POLL_REMOVE";
-}
-
-local multi
-
-local polling = false
-
-function curl_check_multi_info()
+local function curl_check_multi_info()
 	trace("CURL_CHECK_MULTI_INFO")
 	while true do
-		local easy, ok, err = multi:info_read(true)
+		local easy, ok, err = cqcurl.multi:info_read(true)
 		if not easy then
-			multi:close()
+			cqcurl.multi:close()
 			error(err)
 		end
-
 		if easy == 0 then break end
 
-		local done_url = easy:getinfo_effective_url()
-		trace("URL", done_url, ok)
-
-		local code = easy:getinfo_response_code()
-		trace("CODE", code)
-		--easy:reset()
-		polling = false
+		trace("URL", easy:getinfo_effective_url(), ok, easy:getinfo_response_code())
+		easy.data.finishedcond:signal()
 	end
 end
 
-local on_libuv_timeout
+local timeout, timercond
 
-local start_timeout, on_curl_action do
-
-local timercond = condition.new()
-
-start_timeout = function(ms)
-	-- called by curl --
-	trace('CURL::TIMEOUT', ms)
-	if ms <= 0 then ms = 1 end
-
-	-- cancel old timeout
-	timercond:signal()
-
-	cqueues.running():wrap(function()
-		-- sleep
-		if cqueues.poll(timercond, ms / 1000) ~= timercond then
-			-- timeout trigger
-			multi:socket_action()
-			curl_check_multi_info()
-		else
-			trace('--- CURL::TIMEOUT CANCELED')
-		end
-	end)
-end
-
-local pollcond = condition.new()
-local flags
-local fdobj
-
-poll_loop = function()
-	polling = true
-	while polling do
-		local rc = cqueues.poll(fdobj, pollcond)
-		if rc ~= pollcond then
-			multi:socket_action(fdobj.pollfd, flags)
-			curl_check_multi_info()
-		end
+local function curl_timerfunction(ms)
+	trace('CURL_TIMERFUNCTION', ms)
+	timeout = ms >= 0 and ms / 1000 or nil
+	if not timercond then
+		-- Start timer if not yet running
+		timeout = nil
+		timercond = condition.new()
+		cqueues.running():wrap(function()
+			local reason = cqueues.poll(timercond, timeout)
+			if reason ~= timercond or timeout == 0 then
+				trace("TIMEOUT")
+				timeout = nil
+				cqcurl.multi:socket_action()
+				curl_check_multi_info()
+			end
+		end)
+	else
+		-- Wake up timer thread
+		timercond:signal()
 	end
-	trace('POLLING ENDED')
 end
 
-on_curl_action = function(easy, fd, action)
-	local ok, err = pcall(function()
-		trace("CURL::SOCKET", easy, fd, ACTION_NAMES[action] or action)
+local function curl_socketfunction_act(easy, fd, action)
+	local ACTION_NAMES = {
+		[curl.POLL_IN     ] = "POLL_IN",
+		[curl.POLL_INOUT  ] = "POLL_INOUT",
+		[curl.POLL_OUT    ] = "POLL_OUT",
+		[curl.POLL_NONE   ] = "POLL_NONE",
+		[curl.POLL_REMOVE ] = "POLL_REMOVE",
+	}
+	trace("CURL_SOCKETFUNCTION", easy, fd, ACTION_NAMES[action] or action)
 
-		if action == curl.POLL_IN or action == curl.POLL_INOUT or action == curl.POLL_OUT then
-			flags = curl.CSELECT_IN
-			fdobj = { pollfd = fd }
-			if action == curl.POLL_IN then
-				fdobj.events = 'r'
-				flags = curl.CSELECT_IN
-			elseif action == curl.POLL_INOUT then
-				fdobj.events = 'rw'
-				flags = curl.CSELECT_INOUT
-			elseif action == curl.POLL_OUT then
-				fdobj.events = 'w'
-				flags = curl.CSELECT_OUT
-			end
+	local fdobj = fdobjs[fd] or {pollfd=fd}
+	trace("FDOBJ", fdobj)
+	if action == curl.POLL_IN then
+		fdobj.events = 'r'
+		fdobj.flags = curl.CSELECT_IN
+	elseif action == curl.POLL_INOUT then
+		fdobj.events = 'rw'
+		fdobj.flags = curl.CSELECT_INOUT
+	elseif action == curl.POLL_OUT then
+		fdobj.events = 'w'
+		fdobj.flags = curl.CSELECT_OUT
+	elseif action == curl.POLL_REMOVE then
+		fdobj.events = nil
+		fdobj.flags = nil
+	else
+		return
+	end
 
-			if not polling then
-				trace('-- starting')
-				cqueues.running():wrap(poll_loop)
-			else
-				trace('-- poll flags changed')
-				pollcond:signal()
-			end
-			--cqueues.poll(1)
-			--polling = false
-			--cqueues.poll(fdobj)
-
-			--multi:socket_action(fd, flags)
-			--curl_check_multi_info()
-
-		elseif action == curl.POLL_REMOVE then
-			polling = false
-			pollcond:signal()
-			trace('Cancel file descriptor', fd)
+	if fdobj.socketcond then
+		-- Worker running, signal it
+		fdobj.socketcond:signal()
+		if fdobj.events == nil then
 			cqueues.running():cancel(fd)
-			local cond = easy.data.cond
-			easy:close()
-			timercond:signal()
-			cond:signal()
+			fdobjs[fd] = nil
 		end
-	end)
-	if not ok then
-		trace("SOCKET HANDLING ERROR")
+	elseif fdobj.events then
+		-- Worker needed
+		fdobjs[fd] = fdobj
+		fdobj.socketcond = condition.new()
+		cqueues.running():wrap(function()
+			while fdobj.events do
+				local rc = cqueues.poll(fdobj, fdobj.socketcond)
+				if rc == fdobj and fdobj.flags then
+					trace("FD", fd, fdobj.events)
+					cqcurl.multi:socket_action(fd, fdobj.flags)
+					curl_check_multi_info()
+				end
+			end
+		end)
 	end
 end
 
+local function curl_socketfunction(easy, fd, action)
+	local ok, err = pcall(curl_socketfunction_act, easy, fd, action)
+	if not ok then
+		trace("SOCKET HANDLING ERROR", err)
+	end
 end
 
-multi = curl.multi{
-	timerfunction = start_timeout;
-	socketfunction = on_curl_action;
+cqcurl.multi = curl.multi {
+	timerfunction = curl_timerfunction,
+	socketfunction = curl_socketfunction,
 }
-
-local cqcurl = {}
 
 function cqcurl.run(opt)
 	local handle = curl.easy()
 	handle:setopt(opt)
-
-	local cond = condition.new()
-	handle.data = {}
-	handle.data.cond = cond
-	multi:add_handle(handle)
-	cond:wait()
+	handle.data = {
+		finishedcond = condition.new()
+	}
+	cqcurl.multi:add_handle(handle)
+	handle.data.finishedcond:wait()
+	handle:close()
 end
 
 return cqcurl
