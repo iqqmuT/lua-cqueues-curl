@@ -40,6 +40,7 @@ local function curl_timerfunction(ms)
 					curl_check_multi_info()
 				end
 			end
+			timercond = nil
 		end)
 	else
 		-- Wake up timer thread
